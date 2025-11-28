@@ -1,24 +1,34 @@
 # agent.py
+"""
+LLM-powered quiz solver agent using aipipe.org (OpenAI-compatible API).
+Visits quiz URLs, uses LLM to understand tasks, executes actions, and submits answers.
+"""
+
 import asyncio
 import base64
 import io
+import json
 import logging
+import os
 import re
+import subprocess
 import threading
 import time
-from typing import Optional
-from urllib.parse import urljoin
+from typing import Optional, Any
+from urllib.parse import urljoin, urlparse
 
 import httpx
 import pandas as pd
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # ------- Configuration -------
-SUBMIT_ENDPOINT = "https://tds-llm-analysis.s-anand.net/submit"
-TIME_LIMIT_SECONDS = 180  # total seconds allowed per quiz run
-# Default values (main.py passes actual email/secret)
-DEFAULT_EMAIL = None
-DEFAULT_SECRET = None
+AIPIPE_TOKEN = os.getenv("AIPIPE_TOKEN")
+AIPIPE_URL = "https://aipipe.org/openrouter/v1/chat/completions"
+LLM_MODEL = os.getenv("LLM_MODEL", "openai/gpt-4.1-nano")  # Fast model via aipipe
+TIME_LIMIT_SECONDS = 170  # Leave 10s buffer from 3 min limit
 # -----------------------------
 
 logging.basicConfig(level=logging.INFO)
@@ -30,14 +40,10 @@ def run_agent(start_url: str, email: Optional[str] = None, secret: Optional[str]
     Entrypoint expected by FastAPI BackgroundTasks.
     Schedules the async worker safely whether called from an event loop or not.
     """
-    # allow passing defaults if main.py didn't include (but main does)
-    email = email or DEFAULT_EMAIL
-    secret = secret or DEFAULT_SECRET
-
     try:
         loop = asyncio.get_running_loop()
     except RuntimeError:
-        # No running loop -> run in a new thread with its own event loop to avoid blocking FastAPI
+        # No running loop -> run in a new thread with its own event loop
         def _target():
             try:
                 asyncio.run(_run_agent(start_url, email, secret))
@@ -53,8 +59,8 @@ def run_agent(start_url: str, email: Optional[str] = None, secret: Optional[str]
 
 async def _run_agent(start_url: str, email: Optional[str], secret: Optional[str]):
     """
-    Async worker — visits the quiz URL, solves tasks, submits answers, and follows the next URL until done
-    or time runs out.
+    Async worker — visits the quiz URL, uses LLM to solve tasks, submits answers,
+    and follows the next URL until done or time runs out.
     """
     logger.info(f"[agent] starting worker for url={start_url} email={email}")
 
@@ -63,7 +69,7 @@ async def _run_agent(start_url: str, email: Optional[str], secret: Optional[str]
     current_url = start_url
 
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=True, args=["--no-sandbox"])
+        browser = await pw.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
         context = await browser.new_context()
         page = await context.new_page()
 
@@ -75,12 +81,14 @@ async def _run_agent(start_url: str, email: Optional[str], secret: Optional[str]
                     break
 
                 logger.info(f"[agent] visiting {current_url}")
+                
+                # Load the page
                 try:
-                    await page.goto(current_url, timeout=60000, wait_until="domcontentloaded")
+                    await page.goto(current_url, timeout=60000, wait_until="networkidle")
                 except PlaywrightTimeoutError:
-                    logger.warning("[agent] page.goto timed out; trying networkidle then continuing")
+                    logger.warning("[agent] page.goto timed out; trying domcontentloaded")
                     try:
-                        await page.goto(current_url, timeout=120000, wait_until="networkidle")
+                        await page.goto(current_url, timeout=30000, wait_until="domcontentloaded")
                     except Exception as e:
                         logger.exception(f"[agent] page.goto final fail: {e}")
                         break
@@ -88,130 +96,79 @@ async def _run_agent(start_url: str, email: Optional[str], secret: Optional[str]
                     logger.exception("[agent] page.goto unexpected error")
                     break
 
-                # Grab rendered text and full HTML (await properly!)
+                # Wait a bit for JS to execute
+                await asyncio.sleep(1)
+
+                # Get rendered content
                 try:
-                    page_text = await page.evaluate("() => document.documentElement.innerText")
+                    page_text = await page.evaluate("() => document.body.innerText")
                 except Exception:
                     page_text = ""
                 try:
                     page_html = await page.content()
                 except Exception:
-                    page_html = page_text or ""
+                    page_html = ""
 
-                # Try handlers in order
-                # 1) Look for explicit 'Secret code is NNN' in visible text
-                m = re.search(r"Secret code\s*(?:is|=|:)\s*([0-9]+)", page_text, re.I)
-                if m:
-                    answer = m.group(1)
-                    logger.info(f"[agent] found secret in page text: {answer}")
-                    resp = await submit_answer(email, secret, current_url, answer)
-                    if not await _process_submit_response(resp):
-                        break
-                    current_url = resp.get("url")
-                    continue
+                logger.info(f"[agent] page text preview: {page_text[:500]}...")
 
-                # 2) Attempt to decode any atob(...) base64 payloads in HTML (JS-embedded)
-                atob_b64s = re.findall(r'atob\((?:`([^`]+)`|"([^"]+)"|\'([^\']+)\')\)', page_html)
-                # atob_b64s is list of tuples; flatten
-                b64s = []
-                for t in atob_b64s:
-                    for s in t:
-                        if s:
-                            b64s.append(s)
-                decoded_texts = []
-                for b in b64s:
-                    try:
-                        decoded_texts.append(base64.b64decode(b).decode("utf-8", errors="ignore"))
-                    except Exception:
-                        continue
+                # Extract submit URL from the page (don't hardcode!)
+                submit_url = _extract_submit_url(page_text, page_html, current_url)
+                logger.info(f"[agent] extracted submit URL: {submit_url}")
 
-                # Search decoded_texts for secret or instructions
-                found_in_decoded = False
-                for decoded in decoded_texts:
-                    m2 = re.search(r"Secret code\s*(?:is|=|:)\s*([0-9]+)", decoded, re.I)
-                    if m2:
-                        answer = m2.group(1)
-                        logger.info("[agent] found secret in decoded atob payload")
-                        resp = await submit_answer(email, secret, current_url, answer)
-                        if not await _process_submit_response(resp):
-                            return
-                        current_url = resp.get("url")
-                        found_in_decoded = True
-                        break
-                if found_in_decoded:
-                    continue
-
-                # 3) If page mentions 'demo-scrape-data' or similar, try to fetch that endpoint (httpx)
+                # Extract any links from the page
                 links = await _extract_links(page)
-                demo_data_link = None
-                for href in links:
-                    if href and "demo-scrape-data" in href:
-                        demo_data_link = urljoin(current_url, href)
+                
+                # Solve the task using LLM
+                answer = await _solve_task(
+                    current_url=current_url,
+                    page_text=page_text,
+                    page_html=page_html,
+                    links=links,
+                    email=email,
+                    secret=secret
+                )
+                
+                if answer is None:
+                    logger.warning("[agent] could not determine answer, stopping")
+                    break
+
+                logger.info(f"[agent] submitting answer: {str(answer)[:200]}")
+
+                # Submit the answer
+                resp = await _submit_answer(
+                    submit_url=submit_url,
+                    email=email,
+                    secret=secret,
+                    page_url=current_url,
+                    answer=answer
+                )
+
+                if not resp:
+                    logger.error("[agent] submit returned no response")
+                    break
+
+                logger.info(f"[agent] submit response: {resp}")
+
+                if resp.get("correct") is True:
+                    logger.info("[agent] answer correct!")
+                    next_url = resp.get("url")
+                    if next_url:
+                        current_url = next_url
+                        continue
+                    else:
+                        logger.info("[agent] no more URLs, quiz complete!")
                         break
-
-                if demo_data_link:
-                    try:
-                        async with httpx.AsyncClient(timeout=30) as client:
-                            r = await client.get(demo_data_link)
-                            txt = r.text
-                        m3 = re.search(r"Secret code\s*(?:is|=|:)\s*([0-9]+)", txt, re.I)
-                        if m3:
-                            answer = m3.group(1)
-                            logger.info("[agent] found secret in demo-scrape-data endpoint")
-                            resp = await submit_answer(email, secret, current_url, answer)
-                            if not await _process_submit_response(resp):
-                                return
-                            current_url = resp.get("url")
-                            continue
-                    except Exception:
-                        logger.exception("[agent] fetching demo-scrape-data failed")
-
-                # 4) CSV tasks: if the page mentions 'Cutoff' or 'download this csv', find CSV link and sum values >= cutoff
-                if re.search(r"Cutoff[:\s]|download.*csv|download this csv", page_text, re.I):
-                    csv_link = None
-                    for href in links:
-                        if href and href.lower().endswith(".csv"):
-                            csv_link = urljoin(current_url, href)
-                            break
-                    # also look for CSV URL inside HTML
-                    if not csv_link:
-                        m_csv = re.search(r"https?://[^\s'\"]+\.csv", page_html, re.I)
-                        if m_csv:
-                            csv_link = m_csv.group(0)
-                    if csv_link:
-                        logger.info(f"[agent] found CSV link: {csv_link}")
-                        # find cutoff
-                        cm = re.search(r"Cutoff[:\s]*([0-9]+)", page_text, re.I)
-                        cutoff = int(cm.group(1)) if cm else 0
-                        try:
-                            async with httpx.AsyncClient(timeout=60) as client:
-                                r = await client.get(csv_link)
-                                r.raise_for_status()
-                                csv_bytes = r.content
-                            s = await asyncio.to_thread(_sum_csv_first_column, csv_bytes, cutoff)
-                            logger.info(f"[agent] computed CSV sum >= {cutoff} => {s}")
-                            resp = await submit_answer(email, secret, current_url, int(s))
-                            if not await _process_submit_response(resp):
-                                return
-                            current_url = resp.get("url")
-                            continue
-                        except Exception:
-                            logger.exception("[agent] csv download or processing failed")
-
-                # 5) Last resort: find numbers in visible text and try a heuristic (common fallback)
-                nums = [int(x) for x in re.findall(r"\b([0-9]{2,12})\b", page_text)]
-                if nums:
-                    # If exactly one obvious number -> submit it; otherwise submit sum
-                    answer = nums[0] if len(nums) == 1 else sum(nums)
-                    logger.info(f"[agent] fallback numeric answer -> {answer}")
-                    resp = await submit_answer(email, secret, current_url, answer)
-                    if not await _process_submit_response(resp):
-                        return
-                    current_url = resp.get("url")
-                    continue
-
-                logger.warning("[agent] no handler matched this page; stopping")
-                break
+                else:
+                    reason = resp.get("reason", "unknown")
+                    logger.warning(f"[agent] answer incorrect: {reason}")
+                    # Check if there's a next URL to continue anyway
+                    next_url = resp.get("url")
+                    if next_url:
+                        logger.info(f"[agent] moving to next URL despite incorrect answer")
+                        current_url = next_url
+                        continue
+                    else:
+                        break
 
         except Exception:
             logger.exception("[agent] unexpected error in run loop")
@@ -225,84 +182,374 @@ async def _run_agent(start_url: str, email: Optional[str], secret: Optional[str]
     logger.info("[agent] finished worker")
 
 
-async def _process_submit_response(resp_json: Optional[dict]) -> bool:
+def _extract_submit_url(page_text: str, page_html: str, current_url: str) -> str:
     """
-    Return True to continue to next URL (if any), False to stop.
+    Extract the submit URL from the page content.
+    The quiz always includes the submit URL - we should NOT hardcode it.
     """
-    if not resp_json:
-        logger.error("[agent] submit returned no JSON")
-        return False
-    if resp_json.get("correct") is True:
-        logger.info("[agent] submit correct")
-        return True
-    else:
-        reason = resp_json.get("reason", "<no reason>")
-        logger.warning(f"[agent] submit incorrect or failed: {reason}")
-        return False
+    # Look for common patterns
+    patterns = [
+        r'POST[^"\'<>]*?(?:to|TO)\s+(https?://[^\s<>"\']+/submit)',
+        r'post[^"\'<>]*?(?:to|TO)\s+(https?://[^\s<>"\']+/submit)',
+        r'"(https?://[^\s<>"]+/submit)"',
+        r"'(https?://[^\s<>']+/submit)'",
+        r'(https?://[^\s<>"\']+/submit)',
+    ]
+    
+    for pattern in patterns:
+        m = re.search(pattern, page_text, re.I)
+        if m:
+            return m.group(1)
+        m = re.search(pattern, page_html, re.I)
+        if m:
+            return m.group(1)
+    
+    # Fallback: construct from current URL's origin
+    parsed = urlparse(current_url)
+    return f"{parsed.scheme}://{parsed.netloc}/submit"
 
 
-async def submit_answer(email: Optional[str], secret: Optional[str], page_url: str, answer):
+async def _solve_task(
+    current_url: str,
+    page_text: str,
+    page_html: str,
+    links: list,
+    email: str,
+    secret: str
+) -> Optional[Any]:
     """
-    Post answer to the judge endpoint. Returns parsed JSON or None.
+    Main task solver. Uses pattern matching first, then LLM for complex tasks.
     """
-    payload = {"email": email, "secret": secret, "url": page_url, "answer": answer}
-    logger.info(f"[agent] submitting answer for {page_url} -> {str(answer)[:200]}")
-    try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            r = await client.post(SUBMIT_ENDPOINT, json=payload)
+    
+    # Decode any base64 content (atob patterns) first
+    decoded_content = _decode_atob_content(page_html)
+    full_text = page_text
+    if decoded_content:
+        full_text = page_text + "\n\n[DECODED CONTENT]:\n" + decoded_content
+        logger.info(f"[agent] decoded base64 content: {decoded_content[:300]}...")
+
+    # === PATTERN MATCHING (fast path) ===
+    
+    # 1. Check for demo page (accepts any answer)
+    if "anything you want" in full_text.lower():
+        logger.info("[agent] detected demo page, submitting 'demo'")
+        return "demo"
+
+    # 2. Check for simple "secret code" pattern
+    secret_match = re.search(r"[Ss]ecret\s*[Cc]ode\s*(?:is|=|:)\s*([0-9]+)", full_text)
+    if secret_match:
+        logger.info(f"[agent] found secret code pattern: {secret_match.group(1)}")
+        return int(secret_match.group(1))
+
+    # 3. CSV with cutoff task
+    cutoff_match = re.search(r'[Cc]utoff[:\s]*(\d+)', full_text)
+    csv_links = [l for l in links if l and '.csv' in l.lower()]
+    # Also search for CSV URLs in HTML
+    csv_url_match = re.search(r'(https?://[^\s<>"\']+\.csv)', page_html, re.I)
+    if csv_url_match and not csv_links:
+        csv_links.append(csv_url_match.group(1))
+    
+    if csv_links:
+        csv_url = csv_links[0] if csv_links[0].startswith('http') else urljoin(current_url, csv_links[0])
+        cutoff = int(cutoff_match.group(1)) if cutoff_match else 0
+        logger.info(f"[agent] found CSV task: {csv_url}, cutoff={cutoff}")
+        
+        result = await _process_csv_task(csv_url, cutoff, full_text)
+        if result is not None:
+            return result
+
+    # 4. Check for JSON data tasks
+    json_links = [l for l in links if l and '.json' in l.lower()]
+    if json_links:
+        json_url = json_links[0] if json_links[0].startswith('http') else urljoin(current_url, json_links[0])
+        logger.info(f"[agent] found JSON link: {json_url}")
+        result = await _process_json_task(json_url, full_text)
+        if result is not None:
+            return result
+
+    # === LLM PATH (for complex tasks) ===
+    answer = await _solve_with_llm(
+        current_url=current_url,
+        page_text=full_text,
+        page_html=page_html,
+        links=links
+    )
+    
+    if answer is not None:
+        return answer
+
+    # === FALLBACK: extract any obvious answer ===
+    # Look for a single prominent number
+    numbers = re.findall(r'\b(\d{2,10})\b', full_text)
+    if len(numbers) == 1:
+        logger.info(f"[agent] fallback: single number found: {numbers[0]}")
+        return int(numbers[0])
+
+    return None
+
+
+def _decode_atob_content(html: str) -> str:
+    """Decode any atob() base64 content in the HTML."""
+    decoded_parts = []
+    
+    # Find atob patterns (handles backticks, single and double quotes)
+    patterns = [
+        r'atob\(`([^`]+)`\)',
+        r'atob\("([^"]+)"\)',
+        r"atob\('([^']+)'\)",
+    ]
+    
+    for pattern in patterns:
+        for match in re.finditer(pattern, html, re.DOTALL):
             try:
-                j = r.json()
-            except Exception:
-                try:
-                    j = r.json()
-                except Exception:
-                    logger.exception("[agent] submit returned non-json")
-                    return None
-            logger.info(f"[agent] submit response: {j}")
-            return j
-    except Exception:
-        logger.exception("[agent] submit request failed")
+                b64 = match.group(1)
+                # Handle multi-line base64 (remove whitespace)
+                b64_clean = re.sub(r'\s+', '', b64)
+                decoded = base64.b64decode(b64_clean).decode('utf-8', errors='ignore')
+                decoded_parts.append(decoded)
+            except Exception as e:
+                logger.warning(f"[agent] failed to decode base64: {e}")
+                continue
+    
+    return "\n".join(decoded_parts)
+
+
+async def _process_csv_task(csv_url: str, cutoff: int, task_text: str) -> Optional[int]:
+    """Download and process CSV for sum/count/filter tasks."""
+    try:
+        csv_data = await _download_file(csv_url)
+        if not csv_data:
+            return None
+        
+        df = pd.read_csv(io.BytesIO(csv_data))
+        logger.info(f"[agent] CSV loaded: {df.shape}, columns: {list(df.columns)}")
+        
+        # Determine what operation to perform based on task text
+        task_lower = task_text.lower()
+        
+        # Find numeric column(s)
+        numeric_cols = df.select_dtypes(include=['number']).columns.tolist()
+        
+        # Check for specific column mentions
+        target_col = None
+        for col in df.columns:
+            if col.lower() in task_lower or col.lower().replace('_', ' ') in task_lower:
+                target_col = col
+                break
+        
+        if target_col is None and numeric_cols:
+            target_col = numeric_cols[0]
+        
+        if target_col is None:
+            # Use first column
+            target_col = df.columns[0]
+        
+        logger.info(f"[agent] using column: {target_col}")
+        
+        # Convert to numeric
+        values = pd.to_numeric(df[target_col], errors='coerce').dropna()
+        
+        # Apply cutoff filter if specified
+        if cutoff > 0:
+            values = values[values >= cutoff]
+            logger.info(f"[agent] after cutoff filter >= {cutoff}: {len(values)} values")
+        
+        # Determine operation
+        if 'count' in task_lower or 'how many' in task_lower:
+            result = len(values)
+        elif 'average' in task_lower or 'mean' in task_lower:
+            result = values.mean()
+        elif 'max' in task_lower or 'maximum' in task_lower or 'largest' in task_lower:
+            result = values.max()
+        elif 'min' in task_lower or 'minimum' in task_lower or 'smallest' in task_lower:
+            result = values.min()
+        else:
+            # Default to sum
+            result = values.sum()
+        
+        logger.info(f"[agent] CSV result: {result}")
+        return int(result) if pd.notna(result) else None
+        
+    except Exception as e:
+        logger.exception(f"[agent] CSV processing failed: {e}")
         return None
 
 
-def _sum_csv_first_column(csv_bytes: bytes, cutoff: int) -> int:
-    """
-    Parse CSV bytes into pandas DataFrame, take first column, sum values >= cutoff.
-    Handles file with/without header robustly.
-    """
+async def _process_json_task(json_url: str, task_text: str) -> Optional[Any]:
+    """Download and process JSON data."""
     try:
-        buf = io.BytesIO(csv_bytes)
-        # try without headers first
-        try:
-            df = pd.read_csv(buf, header=None)
-        except Exception:
-            buf.seek(0)
-            df = pd.read_csv(buf, header=0)
-        if df.shape[1] < 1:
-            raise ValueError("CSV has no columns")
-        col = pd.to_numeric(df.iloc[:, 0], errors="coerce").dropna().astype(int)
-        col = col[col >= cutoff]
-        return int(col.sum())
-    except Exception:
-        logger.exception("[agent] csv parse failed; falling back to manual parse")
-        s = 0
-        try:
-            text = csv_bytes.decode("utf-8", errors="ignore")
-            for line in text.splitlines():
-                m = re.findall(r"-?\d+", line)
-                if m:
-                    v = int(m[0])
-                    if v >= cutoff:
-                        s += v
-            return s
-        except Exception:
-            return 0
+        data = await _download_file(json_url)
+        if not data:
+            return None
+        
+        json_data = json.loads(data.decode('utf-8'))
+        logger.info(f"[agent] JSON loaded: {type(json_data)}")
+        
+        # Use LLM to process JSON
+        prompt = f"""Analyze this JSON data and answer the question.
+
+QUESTION/TASK:
+{task_text[:2000]}
+
+JSON DATA:
+{json.dumps(json_data, indent=2)[:3000]}
+
+Return ONLY the answer value (number, string, or JSON). No explanation."""
+
+        return await _call_llm(prompt)
+        
+    except Exception as e:
+        logger.exception(f"[agent] JSON processing failed: {e}")
+        return None
+
+
+async def _solve_with_llm(
+    current_url: str,
+    page_text: str,
+    page_html: str,
+    links: list
+) -> Optional[Any]:
+    """Use LLM to understand the task and determine the answer."""
+    
+    if not AIPIPE_TOKEN:
+        logger.warning("[agent] AIPIPE_TOKEN not set, skipping LLM")
+        return None
+
+    # Build context
+    link_text = "\n".join([f"- {link}" for link in links[:15]]) if links else "No links found"
+    
+    prompt = f"""You are solving a data analysis quiz. Read the task and provide the answer.
+
+URL: {current_url}
+
+PAGE CONTENT:
+{page_text[:4000]}
+
+LINKS:
+{link_text}
+
+INSTRUCTIONS:
+1. Read the task carefully
+2. If it's a calculation (sum, count, filter), compute it
+3. If it mentions a secret code, extract it
+4. Return ONLY the answer - a number, string, or JSON object
+
+Common patterns:
+- "Secret code is X" → return X as integer
+- "Sum of values >= cutoff" → compute the sum
+- "How many rows..." → count rows
+- "What is the value..." → extract value
+
+RESPOND WITH ONLY THE FINAL ANSWER. No explanation, no code, just the answer."""
+
+    try:
+        answer = await _call_llm(prompt)
+        if answer:
+            answer = answer.strip()
+            # Try to parse as appropriate type
+            try:
+                # Try integer
+                return int(answer)
+            except ValueError:
+                try:
+                    # Try float
+                    return float(answer)
+                except ValueError:
+                    try:
+                        # Try JSON
+                        return json.loads(answer)
+                    except:
+                        # Return as string
+                        return answer
+    except Exception as e:
+        logger.exception(f"[agent] LLM solving failed: {e}")
+    
+    return None
+
+
+async def _download_file(url: str) -> Optional[bytes]:
+    """Download a file and return its content."""
+    try:
+        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+            resp = await client.get(url)
+            resp.raise_for_status()
+            logger.info(f"[agent] downloaded {url}: {len(resp.content)} bytes")
+            return resp.content
+    except Exception as e:
+        logger.warning(f"[agent] failed to download {url}: {e}")
+        return None
+
+
+async def _call_llm(prompt: str) -> Optional[str]:
+    """Call the LLM via aipipe.org."""
+    if not AIPIPE_TOKEN:
+        logger.warning("[agent] AIPIPE_TOKEN not set")
+        return None
+
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            resp = await client.post(
+                AIPIPE_URL,
+                headers={
+                    "Authorization": f"Bearer {AIPIPE_TOKEN}",
+                    "Content-Type": "application/json"
+                },
+                json={
+                    "model": LLM_MODEL,
+                    "messages": [
+                        {"role": "user", "content": prompt}
+                    ],
+                    "max_tokens": 500,
+                    "temperature": 0
+                }
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            
+            if "choices" in data and len(data["choices"]) > 0:
+                content = data["choices"][0]["message"]["content"]
+                logger.info(f"[agent] LLM response: {content[:200]}...")
+                return content
+            
+            logger.warning(f"[agent] unexpected LLM response: {data}")
+            return None
+    except Exception as e:
+        logger.exception(f"[agent] LLM API call failed: {e}")
+        return None
+
+
+async def _submit_answer(
+    submit_url: str,
+    email: str,
+    secret: str,
+    page_url: str,
+    answer: Any
+) -> Optional[dict]:
+    """Submit answer to the quiz endpoint."""
+    payload = {
+        "email": email,
+        "secret": secret,
+        "url": page_url,
+        "answer": answer
+    }
+    
+    logger.info(f"[agent] POSTing to {submit_url}: {json.dumps(payload)[:500]}")
+    
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.post(submit_url, json=payload)
+            try:
+                return resp.json()
+            except:
+                logger.warning(f"[agent] submit response not JSON: {resp.text[:200]}")
+                return None
+    except Exception as e:
+        logger.exception(f"[agent] submit request failed: {e}")
+        return None
 
 
 async def _extract_links(page) -> list:
-    """
-    Return absolute/relative hrefs from anchor tags (raw strings).
-    """
+    """Extract all href links from the page."""
     hrefs = []
     try:
         anchors = await page.query_selector_all("a")
