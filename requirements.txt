@@ -14,3 +14,4 @@ jsonpatch
 pdfplumber
 numpy
 requests
+Pillow
