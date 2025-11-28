@@ -125,7 +125,8 @@ async def _run_agent(start_url: str, email: Optional[str], secret: Optional[str]
                     page_html=page_html,
                     links=links,
                     email=email,
-                    secret=secret
+                    secret=secret,
+                    page=page  # Pass Playwright page for JS rendering
                 )
                 
                 if answer is None:
@@ -215,7 +216,8 @@ async def _solve_task(
     page_html: str,
     links: list,
     email: str,
-    secret: str
+    secret: str,
+    page=None  # Playwright page object for JS rendering
 ) -> Optional[Any]:
     """
     Main task solver. Uses pattern matching first, then LLM for complex tasks.
@@ -237,18 +239,20 @@ async def _solve_task(
 
     # 2. Check for scrape-data endpoint pattern (e.g., "Scrape /demo-scrape-data?...")
     scrape_match = re.search(r'[Ss]crape\s+(/[^\s]+)', full_text)
-    if scrape_match:
+    if scrape_match and page is not None:
         scrape_path = scrape_match.group(1)
         scrape_url = urljoin(current_url, scrape_path)
-        logger.info(f"[agent] found scrape task, fetching: {scrape_url}")
+        logger.info(f"[agent] found scrape task, navigating to: {scrape_url}")
         
-        scraped_data = await _download_file(scrape_url)
-        if scraped_data:
-            scraped_text = scraped_data.decode('utf-8', errors='ignore')
-            logger.info(f"[agent] scraped content: {scraped_text[:500]}...")
+        # Use Playwright to render the page (handles JavaScript)
+        try:
+            await page.goto(scrape_url, timeout=30000, wait_until="networkidle")
+            await asyncio.sleep(1)  # Wait for JS to execute
+            scraped_text = await page.evaluate("() => document.body.innerText")
+            logger.info(f"[agent] scraped rendered content: {scraped_text[:500]}...")
             
-            # Look for secret code in scraped content (alphanumeric)
-            secret_in_scraped = re.search(r'[Ss]ecret\s*[Cc]ode[:\s]+([a-zA-Z0-9]+)', scraped_text)
+            # Look for secret code in rendered content
+            secret_in_scraped = re.search(r'[Ss]ecret\s*[Cc]ode\s*(?:is)?[:\s]+([a-zA-Z0-9]+)', scraped_text)
             if secret_in_scraped:
                 answer = secret_in_scraped.group(1)
                 logger.info(f"[agent] found secret code in scraped data: {answer}")
@@ -260,6 +264,8 @@ async def _solve_task(
                 answer = code_match.group(1)
                 logger.info(f"[agent] found code in scraped data: {answer}")
                 return answer
+        except Exception as e:
+            logger.exception(f"[agent] scrape with Playwright failed: {e}")
 
     # 3. Check for simple "secret code" pattern
     secret_match = re.search(r"[Ss]ecret\s*[Cc]ode\s*(?:is|=|:)\s*([a-zA-Z0-9]+)", full_text)
@@ -347,8 +353,22 @@ async def _process_csv_task(csv_url: str, cutoff: int, task_text: str) -> Option
         if not csv_data:
             return None
         
-        df = pd.read_csv(io.BytesIO(csv_data))
-        logger.info(f"[agent] CSV loaded: {df.shape}, columns: {list(df.columns)}")
+        # Try to detect if CSV has a header or not
+        # First, try reading without header
+        buf = io.BytesIO(csv_data)
+        first_line = buf.readline().decode('utf-8', errors='ignore').strip()
+        buf.seek(0)
+        
+        # Check if first line looks like a number (no header)
+        try:
+            float(first_line.split(',')[0])
+            # First line is numeric, so no header
+            df = pd.read_csv(buf, header=None)
+            logger.info(f"[agent] CSV loaded (no header): {df.shape}")
+        except ValueError:
+            # First line is not numeric, treat as header
+            df = pd.read_csv(buf)
+            logger.info(f"[agent] CSV loaded (with header): {df.shape}, columns: {list(df.columns)}")
         
         # Determine what operation to perform based on task text
         task_lower = task_text.lower()
