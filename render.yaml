@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: tdsproject2-service
+    runtime: python
+    repo: https://github.com/ananjaygoel/tdsproject2
+    buildCommand: |
+      pip install -r requirements.txt
+      playwright install chromium
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: SECRET
+        sync: false
+      - key: EMAIL
+        sync: false
+      - key: GOOGLE_API_KEY
+        sync: false

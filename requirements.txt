@@ -1,0 +1,16 @@
+fastapi
+uvicorn[standard]
+python-dotenv
+playwright
+httpx
+pandas
+beautifulsoup4
+langgraph
+langchain
+langchain-community
+langchain-google-genai
+google-genai
+jsonpatch
+pdfplumber
+numpy
+requests
