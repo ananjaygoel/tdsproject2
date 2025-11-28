@@ -1152,18 +1152,27 @@ def _decode_atob_content(html: str) -> str:
 
 def _extract_submit_url(page_text: str, page_html: str, current_url: str) -> str:
     """Extract submit URL from page content."""
+    # Patterns to match submit URLs - include optional path after /submit (like /submit/1)
     patterns = [
-        r'POST[^"\'<>]*?(?:to|TO)\s+(https?://[^\s<>"\']+/submit)',
+        r'POST[^"\'<>]*?(?:to|TO)[:\s]+(https?://[^\s<>"\']+/submit/\d+)',
+        r'POST[^"\'<>]*?(?:to|TO)[:\s]+(https?://[^\s<>"\']+/submit)',
+        r'<code[^>]*>(https?://[^\s<>"\']+/submit/\d+)</code>',
+        r'<code[^>]*>(https?://[^\s<>"\']+/submit)</code>',
+        r'"(https?://[^\s<>"]+/submit/\d+)"',
         r'"(https?://[^\s<>"]+/submit)"',
+        r"'(https?://[^\s<>']+/submit/\d+)'",
         r"'(https?://[^\s<>']+/submit)'",
+        r'(https?://[^\s<>"\']+/submit/\d+)',
         r'(https?://[^\s<>"\']+/submit)',
     ]
     
     for pattern in patterns:
-        for text in [page_text, page_html]:
+        for text in [page_html, page_text]:  # Check HTML first for more accurate extraction
             m = re.search(pattern, text, re.I)
             if m:
-                return m.group(1)
+                url = m.group(1)
+                logger.info(f"[agent] extracted submit URL: {url}")
+                return url
     
     # Fallback
     parsed = urlparse(current_url)
