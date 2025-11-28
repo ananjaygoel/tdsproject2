@@ -235,13 +235,39 @@ async def _solve_task(
         logger.info("[agent] detected demo page, submitting 'demo'")
         return "demo"
 
-    # 2. Check for simple "secret code" pattern
-    secret_match = re.search(r"[Ss]ecret\s*[Cc]ode\s*(?:is|=|:)\s*([0-9]+)", full_text)
+    # 2. Check for scrape-data endpoint pattern (e.g., "Scrape /demo-scrape-data?...")
+    scrape_match = re.search(r'[Ss]crape\s+(/[^\s]+)', full_text)
+    if scrape_match:
+        scrape_path = scrape_match.group(1)
+        scrape_url = urljoin(current_url, scrape_path)
+        logger.info(f"[agent] found scrape task, fetching: {scrape_url}")
+        
+        scraped_data = await _download_file(scrape_url)
+        if scraped_data:
+            scraped_text = scraped_data.decode('utf-8', errors='ignore')
+            logger.info(f"[agent] scraped content: {scraped_text[:500]}...")
+            
+            # Look for secret code in scraped content (alphanumeric)
+            secret_in_scraped = re.search(r'[Ss]ecret\s*[Cc]ode[:\s]+([a-zA-Z0-9]+)', scraped_text)
+            if secret_in_scraped:
+                answer = secret_in_scraped.group(1)
+                logger.info(f"[agent] found secret code in scraped data: {answer}")
+                return answer
+            
+            # Also check for just a code/hash pattern
+            code_match = re.search(r'\b([a-f0-9]{6,})\b', scraped_text, re.I)
+            if code_match:
+                answer = code_match.group(1)
+                logger.info(f"[agent] found code in scraped data: {answer}")
+                return answer
+
+    # 3. Check for simple "secret code" pattern
+    secret_match = re.search(r"[Ss]ecret\s*[Cc]ode\s*(?:is|=|:)\s*([a-zA-Z0-9]+)", full_text)
     if secret_match:
         logger.info(f"[agent] found secret code pattern: {secret_match.group(1)}")
-        return int(secret_match.group(1))
+        return secret_match.group(1)
 
-    # 3. CSV with cutoff task
+    # 4. CSV with cutoff task
     cutoff_match = re.search(r'[Cc]utoff[:\s]*(\d+)', full_text)
     csv_links = [l for l in links if l and '.csv' in l.lower()]
     # Also search for CSV URLs in HTML
@@ -258,7 +284,7 @@ async def _solve_task(
         if result is not None:
             return result
 
-    # 4. Check for JSON data tasks
+    # 5. Check for JSON data tasks
     json_links = [l for l in links if l and '.json' in l.lower()]
     if json_links:
         json_url = json_links[0] if json_links[0].startswith('http') else urljoin(current_url, json_links[0])
@@ -432,23 +458,29 @@ INSTRUCTIONS:
 1. Read the task carefully
 2. If it's a calculation (sum, count, filter), compute it
 3. If it mentions a secret code, extract it
-4. Return ONLY the answer - a number, string, or JSON object
+4. Return ONLY the raw answer value
 
-Common patterns:
-- "Secret code is X" → return X as integer
-- "Sum of values >= cutoff" → compute the sum
-- "How many rows..." → count rows
-- "What is the value..." → extract value
+IMPORTANT: Return ONLY the answer itself. Examples:
+- If secret code is "abc123" → respond: abc123
+- If sum is 42 → respond: 42
+- DO NOT wrap in JSON like {{"answer": ...}}
+- DO NOT add explanation or quotes
 
-RESPOND WITH ONLY THE FINAL ANSWER. No explanation, no code, just the answer."""
+RESPOND WITH ONLY THE RAW ANSWER VALUE."""
 
     try:
         answer = await _call_llm(prompt)
         if answer:
             answer = answer.strip()
+            # Remove markdown code fences if present
+            if answer.startswith('```'):
+                answer = re.sub(r'^```[a-z]*\n?', '', answer)
+                answer = re.sub(r'\n?```$', '', answer)
+                answer = answer.strip()
+            
             # Try to parse as appropriate type
             try:
-                # Try integer
+                # Try integer first
                 return int(answer)
             except ValueError:
                 try:
@@ -456,8 +488,16 @@ RESPOND WITH ONLY THE FINAL ANSWER. No explanation, no code, just the answer."""
                     return float(answer)
                 except ValueError:
                     try:
-                        # Try JSON
-                        return json.loads(answer)
+                        # Try JSON - but extract the value if it's a simple {"answer": ...} wrapper
+                        parsed = json.loads(answer)
+                        if isinstance(parsed, dict):
+                            # If it's a dict with 'answer' key, extract that value
+                            if 'answer' in parsed and len(parsed) == 1:
+                                return parsed['answer']
+                            # If it has a single key, return that value
+                            if len(parsed) == 1:
+                                return list(parsed.values())[0]
+                        return parsed
                     except:
                         # Return as string
                         return answer
