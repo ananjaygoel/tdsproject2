@@ -202,12 +202,14 @@ async def _collect_page_data(
     - PDF files
     - Images
     - Scraped sub-pages
+    - API endpoints
     """
     data = {
         "csv_data": [],
         "json_data": [],
         "pdf_data": [],
         "image_data": [],
+        "api_data": [],
         "scraped_pages": [],
     }
     
@@ -277,7 +279,116 @@ async def _collect_page_data(
         except Exception as e:
             logger.warning(f"[agent] scrape failed: {e}")
     
+    # Fetch API endpoints mentioned in the page
+    api_data = await _fetch_api_endpoints(page_text, page_html)
+    data["api_data"] = api_data
+    
     return data
+
+
+async def _fetch_api_endpoints(page_text: str, page_html: str) -> List[Dict]:
+    """
+    Find and fetch API endpoints mentioned in the page.
+    Handles pagination, auth headers, and multiple endpoints.
+    """
+    api_results = []
+    
+    # Find API endpoint URLs
+    api_pattern = r'https?://[^\s<>"\']+/api/[^\s<>"\']*'
+    api_urls = set(re.findall(api_pattern, page_html, re.I))
+    
+    # Also check for code blocks
+    code_pattern = r'<code[^>]*>([^<]*https?://[^\s<>"\']+/api/[^\s<>"\']*[^<]*)</code>'
+    for match in re.finditer(code_pattern, page_html, re.I):
+        url = match.group(1).strip()
+        api_urls.add(url)
+    
+    # Extract auth headers from page text
+    headers = {}
+    header_match = re.search(r'header\s*[`<>"\']*(X-[A-Za-z-]+)[`<>"\']*\s*(?:with\s*value|:)\s*[`<>"\']*([a-zA-Z0-9-]+)', page_text, re.I)
+    if header_match:
+        headers[header_match.group(1)] = header_match.group(2)
+        logger.info(f"[agent] found auth header: {header_match.group(1)}={header_match.group(2)}")
+    
+    for url in api_urls:
+        logger.info(f"[agent] fetching API: {url}")
+        
+        # Check if pagination is needed
+        if 'page=' in url or 'pagination' in page_text.lower():
+            all_data = await _fetch_paginated_api(url, headers)
+            if all_data:
+                api_results.append({
+                    "url": url,
+                    "paginated": True,
+                    "data": all_data,
+                    "count": len(all_data)
+                })
+        else:
+            # Single fetch
+            result = await _fetch_api(url, headers)
+            if result is not None:
+                api_results.append({
+                    "url": url,
+                    "paginated": False,
+                    "data": result
+                })
+    
+    return api_results
+
+
+async def _fetch_api(url: str, headers: Dict = None) -> Optional[Any]:
+    """Fetch a single API endpoint."""
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            resp = await client.get(url, headers=headers or {})
+            resp.raise_for_status()
+            return resp.json()
+    except Exception as e:
+        logger.warning(f"[agent] API fetch failed {url}: {e}")
+        return None
+
+
+async def _fetch_paginated_api(base_url: str, headers: Dict = None) -> List[Any]:
+    """Fetch all pages of a paginated API."""
+    all_data = []
+    page = 1
+    max_pages = 100  # Safety limit
+    
+    # Determine base URL for pagination
+    if '?' in base_url:
+        if 'page=' in base_url:
+            # Replace existing page param
+            base_for_pagination = re.sub(r'page=\d+', 'page={}', base_url)
+        else:
+            base_for_pagination = base_url + '&page={}'
+    else:
+        base_for_pagination = base_url + '?page={}'
+    
+    try:
+        async with httpx.AsyncClient(timeout=30) as client:
+            while page <= max_pages:
+                url = base_for_pagination.format(page)
+                resp = await client.get(url, headers=headers or {})
+                resp.raise_for_status()
+                data = resp.json()
+                
+                # Check for empty response
+                if not data or (isinstance(data, list) and len(data) == 0):
+                    break
+                
+                if isinstance(data, list):
+                    all_data.extend(data)
+                else:
+                    all_data.append(data)
+                
+                page += 1
+                
+        logger.info(f"[agent] fetched {page-1} pages, {len(all_data)} items from {base_url}")
+        return all_data
+        
+    except Exception as e:
+        logger.warning(f"[agent] paginated fetch failed: {e}")
+        return all_data if all_data else []
 
 
 async def _download_and_parse_csv(url: str) -> Optional[Dict]:
@@ -429,10 +540,22 @@ async def _solve_task(
         logger.info(f"[agent] found secret code: {secret_match.group(1)}")
         return secret_match.group(1)
     
+    # 4. DOM Parsing - hidden-key with reversed text
+    hidden_key_match = re.search(r'class\s*=\s*["\']hidden-key["\'][^>]*>([^<]+)<', page_html, re.I)
+    if hidden_key_match:
+        reversed_text = hidden_key_match.group(1).strip()
+        unreversed = reversed_text[::-1]  # Reverse the string
+        logger.info(f"[agent] found hidden-key reversed text: {reversed_text} -> {unreversed}")
+        return unreversed
+    
     # === DATA-BASED SOLVING ===
     
-    # Build context for LLM
+    # Build context for LLM (include both visible text and HTML for DOM tasks)
     context_parts = [f"PAGE URL: {current_url}", f"PAGE CONTENT:\n{page_text[:3000]}"]
+    
+    # Include HTML for DOM parsing tasks
+    if 'dom' in page_text.lower() or 'hidden' in page_text.lower() or 'reversed' in page_text.lower():
+        context_parts.append(f"\nPAGE HTML (for DOM parsing):\n{page_html[:4000]}")
     
     # Add CSV data context
     for csv_item in collected_data.get("csv_data", []):
@@ -460,9 +583,65 @@ async def _solve_task(
     for img_item in collected_data.get("image_data", []):
         context_parts.append(f"\nIMAGE: {img_item['url']} (available for vision analysis)")
     
+    # Add API data context
+    for api_item in collected_data.get("api_data", []):
+        context_parts.append(f"\nAPI ENDPOINT: {api_item['url']}")
+        if api_item.get("paginated"):
+            context_parts.append(f"Paginated: {api_item['count']} total items")
+        api_data_str = json.dumps(api_item['data'], default=str)
+        # Limit size but show enough for analysis
+        if len(api_data_str) > 3000:
+            context_parts.append(f"Data (truncated): {api_data_str[:3000]}...")
+        else:
+            context_parts.append(f"Data: {api_data_str}")
+    
     full_context = "\n".join(context_parts)
     
-    # === TRY SIMPLE CALCULATIONS FIRST ===
+    # === TRY SPECIFIC PATTERNS ===
+    
+    # Pattern: Find item by ID in paginated data
+    id_match = re.search(r'(?:item|record)\s+with\s+ID\s+(\d+)', page_text, re.I)
+    if id_match and collected_data.get("api_data"):
+        target_id = int(id_match.group(1))
+        for api_item in collected_data["api_data"]:
+            data = api_item.get("data", [])
+            if isinstance(data, list):
+                for item in data:
+                    if isinstance(item, dict) and item.get("id") == target_id:
+                        # Return the name or relevant field
+                        if "name" in item:
+                            logger.info(f"[agent] found item ID {target_id}: {item['name']}")
+                            return item["name"]
+    
+    # Pattern: Find highest/lowest value
+    highest_match = re.search(r'highest\s+(\w+)', page_text, re.I)
+    if highest_match and collected_data.get("api_data"):
+        field = highest_match.group(1).lower()
+        for api_item in collected_data["api_data"]:
+            data = api_item.get("data", [])
+            if isinstance(data, list) and data:
+                # Find item with highest value for the field
+                max_item = None
+                max_val = float('-inf')
+                for item in data:
+                    if isinstance(item, dict):
+                        for key, val in item.items():
+                            if key.lower() == field or field in key.lower():
+                                try:
+                                    num_val = float(val)
+                                    if num_val > max_val:
+                                        max_val = num_val
+                                        max_item = item
+                                except (TypeError, ValueError):
+                                    pass
+                if max_item:
+                    # Return city/name/id
+                    for key in ["city", "name", "id"]:
+                        if key in max_item:
+                            logger.info(f"[agent] highest {field}: {max_item}")
+                            return max_item[key]
+    
+    # === TRY SIMPLE CALCULATIONS ===
     
     # Check for cutoff/sum pattern with CSV
     cutoff_match = re.search(r'[Cc]utoff[:\s]*(\d+)', page_text)
