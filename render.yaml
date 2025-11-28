@@ -12,5 +12,7 @@ services:
         sync: false
       - key: EMAIL
         sync: false
+      - key: AIPIPE_TOKEN
+        sync: false
       - key: GOOGLE_API_KEY
         sync: false
