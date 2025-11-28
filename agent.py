@@ -376,10 +376,11 @@ async def _process_csv_task(csv_url: str, cutoff: int, task_text: str) -> Option
         # Find numeric column(s)
         numeric_cols = df.select_dtypes(include=['number']).columns.tolist()
         
-        # Check for specific column mentions
+        # Check for specific column mentions (only for string column names)
         target_col = None
         for col in df.columns:
-            if col.lower() in task_lower or col.lower().replace('_', ' ') in task_lower:
+            col_str = str(col)
+            if col_str.lower() in task_lower or col_str.lower().replace('_', ' ') in task_lower:
                 target_col = col
                 break
         
